@@ -12,9 +12,12 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Transforms/Scalar/MemCpyOptimizer.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/ScopeExit.h"
+#include "llvm/ADT/SmallBitVector.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/iterator_range.h"
@@ -32,6 +35,7 @@
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DerivedTypes.h"
@@ -2185,19 +2189,47 @@ bool MemCpyOptPass::processImmutArgument(CallBase &CB, unsigned ArgNo) {
   return true;
 }
 
-// Turn a call whose entire effect is to copy an aggregate argument into its
-// result slot into a memcpy. This exposes the copy to stack-move optimization
-// even when the callee cannot be inlined.
+static std::optional<std::pair<unsigned, unsigned>>
+getForwardingRange(Value *Dest, Value *Src, uint64_t Size, Argument *DestArg,
+                   Argument *SrcArg, const DataLayout &DL, uint64_t DestSize,
+                   uint64_t SrcSize) {
+  auto DestOffset = Dest->getPointerOffsetFrom(DestArg, DL);
+  auto SrcOffset = Src->getPointerOffsetFrom(SrcArg, DL);
+  if (!DestOffset || !SrcOffset || *DestOffset < 0 || *DestOffset != *SrcOffset)
+    return std::nullopt;
+  uint64_t Offset = *DestOffset;
+  if (!Size || Offset > DestSize || Size > DestSize - Offset ||
+      Offset > SrcSize || Size > SrcSize - Offset)
+    return std::nullopt;
+  return std::pair<unsigned, unsigned>(Offset, Offset + Size);
+}
+
+// Replace a call whose only effect is to forward every byte of its result
+// from the same offset in an input argument. The resulting memcpy can then be
+// removed by stack-move optimization, even when the callee is not inlined.
 bool MemCpyOptPass::processForwardingCall(CallInst *C,
                                           BasicBlock::iterator &BBI) {
   Function *F = C->getCalledFunction();
-  // Bound inspection of the callee body at each call site.
-  if (!F || !F->hasExactDefinition() || F->arg_size() != 2 ||
-      C->arg_size() != 2 || !F->getReturnType()->isVoidTy() || F->size() != 1 ||
-      F->front().size() > 16 || C->hasOperandBundles() || C->isMustTailCall() ||
-      C->isConvergent() || !C->paramHasAttr(0, Attribute::NoAlias) ||
+  // Inspecting a callee per call site costs O(arguments + instructions + CFG
+  // edges * copied bytes). Keep that work small for frequently called helpers.
+  constexpr unsigned MaxForwardedBytes = 1024;
+  constexpr unsigned MaxForwardingArguments = 8;
+  constexpr unsigned MaxForwardingBlocks = 8;
+  constexpr unsigned MaxForwardingInstructions = 64;
+  if (!F || !F->hasExactDefinition() || F->arg_size() < 2 ||
+      F->arg_size() > MaxForwardingArguments ||
+      C->arg_size() != F->arg_size() || !F->getReturnType()->isVoidTy() ||
+      C->hasOperandBundles() || C->isMustTailCall() || C->isConvergent() ||
+      F->isConvergent() || !C->paramHasAttr(0, Attribute::NoAlias) ||
       !C->paramHasAttr(1, Attribute::NoAlias))
     return false;
+  for (unsigned I = 0; I != C->arg_size(); ++I)
+    if (C->isByValArgument(I) || C->paramHasAttr(I, Attribute::ByRef) ||
+        C->paramHasAttr(I, Attribute::InAlloca) ||
+        C->paramHasAttr(I, Attribute::Preallocated) ||
+        C->paramHasAttr(I, Attribute::SwiftError) ||
+        (I != 0 && C->paramHasAttr(I, Attribute::StructRet)))
+      return false;
 
   auto *Dest = dyn_cast<AllocaInst>(C->getArgOperand(0));
   auto *Src = dyn_cast<AllocaInst>(C->getArgOperand(1));
@@ -2209,43 +2241,134 @@ bool MemCpyOptPass::processForwardingCall(CallInst *C,
   const DataLayout &DL = C->getDataLayout();
   auto DestSize = Dest->getAllocationSize(DL);
   auto SrcSize = Src->getAllocationSize(DL);
-  if (!DestSize || !SrcSize || !DestSize->isFixed() || *DestSize != *SrcSize)
+  if (!DestSize || !SrcSize || !DestSize->isFixed() || !SrcSize->isFixed() ||
+      !DestSize->getFixedValue() ||
+      DestSize->getFixedValue() > MaxForwardedBytes || *DestSize > *SrcSize)
     return false;
 
-  Argument *DestArg = F->getArg(0);
-  Argument *SrcArg = F->getArg(1);
-  SmallVector<std::pair<uint64_t, uint64_t>, 4> Copies;
-  for (Instruction &I : F->front()) {
-    if (auto *M = dyn_cast<MemCpyInst>(&I)) {
-      if (M->isVolatile())
-        return false;
-      auto *Len = dyn_cast<ConstantInt>(M->getLength());
-      if (!Len || Len->getValue().getActiveBits() > 64 || Len->isZero())
-        return false;
-      auto DestOffset = M->getRawDest()->getPointerOffsetFrom(DestArg, DL);
-      auto SrcOffset = M->getRawSource()->getPointerOffsetFrom(SrcArg, DL);
-      if (!DestOffset || !SrcOffset || *DestOffset < 0 ||
-          *DestOffset != *SrcOffset)
-        return false;
-      Copies.emplace_back(*DestOffset, Len->getZExtValue());
-    } else if (!isa<GetElementPtrInst, ReturnInst, DbgInfoIntrinsic>(&I)) {
+  unsigned BlocksScanned = 0, InstructionsScanned = 0;
+  for (BasicBlock &BB : *F) {
+    if (++BlocksScanned > MaxForwardingBlocks)
       return false;
+    for (Instruction &I : BB) {
+      if (++InstructionsScanned > MaxForwardingInstructions ||
+          I.getNumOperands() > MaxForwardingInstructions)
+        return false;
     }
   }
 
-  llvm::sort(Copies);
-  uint64_t End = 0;
-  for (auto [Offset, Length] : Copies) {
-    if (Offset != End || Length > DestSize->getFixedValue() - End)
+  Argument *DestArg = F->getArg(0);
+  Argument *SrcArg = F->getArg(1);
+  SmallPtrSet<BasicBlock *, MaxForwardingBlocks> Reachable;
+  SmallVector<BasicBlock *, MaxForwardingBlocks> Blocks;
+  Reachable.insert(&F->getEntryBlock());
+  Blocks.push_back(&F->getEntryBlock());
+  for (unsigned I = 0; I != Blocks.size(); ++I) {
+    BasicBlock *BB = Blocks[I];
+    if (!isa<CondBrInst, UncondBrInst, ReturnInst>(BB->getTerminator()))
       return false;
-    End += Length;
+    for (BasicBlock *Succ : successors(BB))
+      if (Reachable.insert(Succ).second)
+        Blocks.push_back(Succ);
   }
-  if (End == 0 || End != DestSize->getFixedValue())
+
+  DenseMap<BasicBlock *, unsigned> Indegree;
+  SmallVector<BasicBlock *, MaxForwardingBlocks> Order;
+  for (BasicBlock *BB : Blocks) {
+    unsigned Count = 0;
+    for (BasicBlock *Pred : predecessors(BB))
+      Count += Reachable.contains(Pred);
+    Indegree[BB] = Count;
+    if (!Count)
+      Order.push_back(BB);
+  }
+  for (unsigned I = 0; I != Order.size(); ++I)
+    for (BasicBlock *Succ : successors(Order[I]))
+      if (!--Indegree[Succ])
+        Order.push_back(Succ);
+  if (Order.size() != Blocks.size()) // A cycle may fail to return.
+    return false;
+
+  // Only copies to DestArg are accepted below. Its noalias contract keeps
+  // SrcArg unchanged, while intersection at joins tracks bytes written on
+  // every path. Other accepted instructions have no observable effects.
+  DenseMap<BasicBlock *, SmallBitVector> Covered;
+  unsigned Returns = 0;
+  for (BasicBlock *BB : Order) {
+    SmallBitVector Bytes(DestSize->getFixedValue());
+    if (BB != &F->getEntryBlock()) {
+      bool First = true;
+      for (BasicBlock *Pred : predecessors(BB)) {
+        if (!Reachable.contains(Pred))
+          continue;
+        if (First) {
+          Bytes = Covered.lookup(Pred);
+          First = false;
+        } else {
+          Bytes &= Covered.lookup(Pred);
+        }
+      }
+    }
+
+    for (Instruction &I : *BB) {
+      std::optional<std::pair<unsigned, unsigned>> Range;
+      if (auto *M = dyn_cast<MemCpyInst>(&I)) {
+        auto *Len = dyn_cast<ConstantInt>(M->getLength());
+        if (M->getIntrinsicID() == Intrinsic::memcpy_inline ||
+            M->isVolatile() || M->hasMetadataOtherThanDebugLoc() || !Len ||
+            Len->getValue().getActiveBits() > 64)
+          return false;
+        Range = getForwardingRange(
+            M->getRawDest(), M->getRawSource(), Len->getZExtValue(), DestArg,
+            SrcArg, DL, DestSize->getFixedValue(), SrcSize->getFixedValue());
+      } else if (auto *LI = dyn_cast<LoadInst>(&I)) {
+        if (!LI->isSimple() || LI->hasMetadataOtherThanDebugLoc() ||
+            LI->use_empty())
+          return false;
+        for (User *U : LI->users()) {
+          auto *SI = dyn_cast<StoreInst>(U);
+          if (!SI || SI->getValueOperand() != LI)
+            return false;
+        }
+      } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
+        auto *LI = dyn_cast<LoadInst>(SI->getValueOperand());
+        if (!SI->isSimple() || SI->hasMetadataOtherThanDebugLoc() || !LI ||
+            LI->getFunction() != F)
+          return false;
+        Type *T = LI->getType();
+        // A scalar store must overwrite exactly the bytes loaded. For example,
+        // storing i1 does not preserve the other bits of its storage byte.
+        if ((!T->isIntegerTy() || T->getIntegerBitWidth() % 8 != 0) &&
+            (!T->isPointerTy() || DL.isNonIntegralPointerType(T) ||
+             DL.getPointerSizeInBits(T->getPointerAddressSpace()) % 8 != 0))
+          return false;
+        Range = getForwardingRange(
+            SI->getPointerOperand(), LI->getPointerOperand(),
+            DL.getTypeStoreSize(T).getFixedValue(), DestArg, SrcArg, DL,
+            DestSize->getFixedValue(), SrcSize->getFixedValue());
+      } else if (isa<ReturnInst>(&I)) {
+        if (!Bytes.all())
+          return false;
+        ++Returns;
+      } else if (!isa<CondBrInst, UncondBrInst, GetElementPtrInst, PHINode,
+                      BinaryOperator, CmpInst, SelectInst, FreezeInst, CastInst,
+                      DbgInfoIntrinsic>(&I)) {
+        return false;
+      }
+      if (Range)
+        Bytes.set(Range->first, Range->second);
+      else if (isa<MemCpyInst, StoreInst>(&I))
+        return false;
+    }
+    Covered[BB] = std::move(Bytes);
+  }
+  if (!Returns)
     return false;
 
   IRBuilder<> Builder(C);
-  auto *M =
-      Builder.CreateMemCpy(Dest, Dest->getAlign(), Src, Src->getAlign(), End);
+  Builder.SetCurrentDebugLocation(C->getDebugLoc());
+  auto *M = Builder.CreateMemCpy(Dest, Dest->getAlign(), Src, Src->getAlign(),
+                                 DestSize->getFixedValue());
   auto *NewAccess =
       MSSAU->createMemoryAccessBefore(M, nullptr, MSSA->getMemoryAccess(C));
   MSSAU->insertDef(cast<MemoryDef>(NewAccess), /*RenameUses=*/true);
