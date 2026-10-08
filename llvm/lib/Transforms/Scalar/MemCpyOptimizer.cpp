@@ -71,6 +71,7 @@ STATISTIC(NumMoveToCpy, "Number of memmoves converted to memcpy");
 STATISTIC(NumCpyToSet, "Number of memcpys converted to memset");
 STATISTIC(NumCallSlot, "Number of call slot optimizations performed");
 STATISTIC(NumStackMove, "Number of stack-move optimizations performed");
+STATISTIC(NumForwardingCall, "Number of aggregate forwarding calls replaced");
 
 namespace {
 
@@ -2184,6 +2185,76 @@ bool MemCpyOptPass::processImmutArgument(CallBase &CB, unsigned ArgNo) {
   return true;
 }
 
+// Turn a call whose entire effect is to copy an aggregate argument into its
+// result slot into a memcpy. This exposes the copy to stack-move optimization
+// even when the callee cannot be inlined.
+bool MemCpyOptPass::processForwardingCall(CallInst *C,
+                                          BasicBlock::iterator &BBI) {
+  Function *F = C->getCalledFunction();
+  // Bound inspection of the callee body at each call site.
+  if (!F || !F->hasExactDefinition() || F->arg_size() != 2 ||
+      C->arg_size() != 2 || !F->getReturnType()->isVoidTy() || F->size() != 1 ||
+      F->front().size() > 16 || C->hasOperandBundles() || C->isMustTailCall() ||
+      C->isConvergent() || !C->paramHasAttr(0, Attribute::NoAlias) ||
+      !C->paramHasAttr(1, Attribute::NoAlias))
+    return false;
+
+  auto *Dest = dyn_cast<AllocaInst>(C->getArgOperand(0));
+  auto *Src = dyn_cast<AllocaInst>(C->getArgOperand(1));
+  if (!Dest || !Src || Dest == Src || !Dest->isStaticAlloca() ||
+      !Src->isStaticAlloca() ||
+      Dest->getAddressSpace() != Src->getAddressSpace())
+    return false;
+
+  const DataLayout &DL = C->getDataLayout();
+  auto DestSize = Dest->getAllocationSize(DL);
+  auto SrcSize = Src->getAllocationSize(DL);
+  if (!DestSize || !SrcSize || !DestSize->isFixed() || *DestSize != *SrcSize)
+    return false;
+
+  Argument *DestArg = F->getArg(0);
+  Argument *SrcArg = F->getArg(1);
+  SmallVector<std::pair<uint64_t, uint64_t>, 4> Copies;
+  for (Instruction &I : F->front()) {
+    if (auto *M = dyn_cast<MemCpyInst>(&I)) {
+      if (M->isVolatile())
+        return false;
+      auto *Len = dyn_cast<ConstantInt>(M->getLength());
+      if (!Len || Len->getValue().getActiveBits() > 64 || Len->isZero())
+        return false;
+      auto DestOffset = M->getRawDest()->getPointerOffsetFrom(DestArg, DL);
+      auto SrcOffset = M->getRawSource()->getPointerOffsetFrom(SrcArg, DL);
+      if (!DestOffset || !SrcOffset || *DestOffset < 0 ||
+          *DestOffset != *SrcOffset)
+        return false;
+      Copies.emplace_back(*DestOffset, Len->getZExtValue());
+    } else if (!isa<GetElementPtrInst, ReturnInst, DbgInfoIntrinsic>(&I)) {
+      return false;
+    }
+  }
+
+  llvm::sort(Copies);
+  uint64_t End = 0;
+  for (auto [Offset, Length] : Copies) {
+    if (Offset != End || Length > DestSize->getFixedValue() - End)
+      return false;
+    End += Length;
+  }
+  if (End == 0 || End != DestSize->getFixedValue())
+    return false;
+
+  IRBuilder<> Builder(C);
+  auto *M =
+      Builder.CreateMemCpy(Dest, Dest->getAlign(), Src, Src->getAlign(), End);
+  auto *NewAccess =
+      MSSAU->createMemoryAccessBefore(M, nullptr, MSSA->getMemoryAccess(C));
+  MSSAU->insertDef(cast<MemoryDef>(NewAccess), /*RenameUses=*/true);
+  eraseInstruction(C);
+  BBI = M->getIterator();
+  ++NumForwardingCall;
+  return true;
+}
+
 /// Executes one iteration of MemCpyOptPass.
 bool MemCpyOptPass::iterateOnFunction(Function &F) {
   bool MadeChange = false;
@@ -2212,6 +2283,11 @@ bool MemCpyOptPass::iterateOnFunction(Function &F) {
       else if (auto *M = dyn_cast<MemMoveInst>(I))
         RepeatInstruction = processMemMove(M, BI);
       else if (auto *CB = dyn_cast<CallBase>(I)) {
+        if (auto *C = dyn_cast<CallInst>(CB))
+          if (processForwardingCall(C, BI)) {
+            MadeChange = true;
+            continue;
+          }
         for (unsigned i = 0, e = CB->arg_size(); i != e; ++i) {
           if (CB->isByValArgument(i))
             MadeChange |= processByValArgument(*CB, i);
