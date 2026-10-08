@@ -561,3 +561,86 @@ define void @keep_large_aggregate() {
 }
 
 !0 = !{i64 0, i64 10}
+
+; An operand bundle on the inner memcpy can introduce additional effects.
+define internal void @forward_bundled_copy(ptr noalias %out, ptr noalias %in) noinline {
+  call void @llvm.memcpy.p0.p0.i64(ptr %out, ptr %in, i64 8, i1 false) [ "unknown"(ptr %in) ]
+  ret void
+}
+
+define void @keep_bundled_copy() {
+; CHECK-LABEL: define void @keep_bundled_copy() {
+; CHECK: call void @forward_bundled_copy(
+  %src = alloca [8 x i8], align 8
+  %dst = alloca [8 x i8], align 8
+  call void @forward_bundled_copy(ptr noalias %dst, ptr noalias %src)
+  call void @observe(ptr captures(none) %dst)
+  ret void
+}
+
+; Contradictory memory attributes must not crash the MemorySSA update, even
+; though executing these calls has undefined behavior.
+define void @keep_readnone_call() {
+; CHECK-LABEL: define void @keep_readnone_call() {
+; CHECK: call void @forward_prefix(
+  %src = alloca [48 x i8], align 8
+  %dst = alloca [48 x i8], align 8
+  call void @forward_prefix(ptr noalias %dst, ptr noalias %src) memory(none)
+  call void @observe(ptr captures(none) %dst)
+  ret void
+}
+
+define void @keep_readonly_call() {
+; CHECK-LABEL: define void @keep_readonly_call() {
+; CHECK: call void @forward_prefix(
+  %src = alloca [48 x i8], align 8
+  %dst = alloca [48 x i8], align 8
+  call void @forward_prefix(ptr noalias %dst, ptr noalias %src) memory(read)
+  call void @observe(ptr captures(none) %dst)
+  ret void
+}
+
+; The join must intersect coverage: the second half is absent on one path.
+define internal void @forward_partial_join(ptr noalias %out, ptr noalias %in,
+                                          i1 %flag) noinline {
+entry:
+  call void @llvm.memcpy.p0.p0.i64(ptr %out, ptr %in, i64 8, i1 false)
+  br i1 %flag, label %rest, label %done
+rest:
+  %in.8 = getelementptr i8, ptr %in, i64 8
+  %out.8 = getelementptr i8, ptr %out, i64 8
+  call void @llvm.memcpy.p0.p0.i64(ptr %out.8, ptr %in.8, i64 8, i1 false)
+  br label %done
+done:
+  ret void
+}
+
+define void @keep_partial_join(i1 %flag) {
+; CHECK-LABEL: define void @keep_partial_join(i1 %flag) {
+; CHECK: call void @forward_partial_join(
+  %src = alloca [16 x i8], align 8
+  %dst = alloca [16 x i8], align 8
+  call void @forward_partial_join(ptr noalias %dst, ptr noalias %src, i1 %flag)
+  call void @observe(ptr captures(none) %dst)
+  ret void
+}
+
+; Distinct contents needed after the call must still have distinct storage.
+define void @keep_independent_storage() {
+; CHECK-LABEL: define void @keep_independent_storage() {
+; CHECK: %src = alloca [48 x i8]
+; CHECK: %dst = alloca [48 x i8]
+; CHECK-NOT: call void @forward_prefix
+; CHECK: call void @llvm.memcpy.p0.p0.i64(ptr align 8 %dst, ptr align 8 %src, i64 48, i1 false)
+; CHECK: store i8 7, ptr %src
+; CHECK: call void @observe(ptr captures(none) %dst)
+; CHECK: call void @observe(ptr captures(none) %src)
+  %src = alloca [48 x i8], align 8
+  %dst = alloca [48 x i8], align 8
+  call void @produce(ptr captures(address) %src)
+  call void @forward_prefix(ptr noalias %dst, ptr noalias %src)
+  store i8 7, ptr %src
+  call void @observe(ptr captures(none) %dst)
+  call void @observe(ptr captures(none) %src)
+  ret void
+}

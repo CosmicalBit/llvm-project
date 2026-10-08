@@ -2208,7 +2208,7 @@ getForwardingRange(Value *Dest, Value *Src, uint64_t Size, Argument *DestArg,
 // from the same offset in an input argument. The resulting memcpy can then be
 // removed by stack-move optimization, even when the callee is not inlined.
 bool MemCpyOptPass::processForwardingCall(CallInst *C,
-                                          BasicBlock::iterator &BBI) {
+                                        BasicBlock::iterator &BBI) {
   Function *F = C->getCalledFunction();
   // Inspecting a callee per call site costs O(arguments + instructions + CFG
   // edges * copied bytes). Keep that work small for frequently called helpers.
@@ -2222,6 +2222,11 @@ bool MemCpyOptPass::processForwardingCall(CallInst *C,
       C->hasOperandBundles() || C->isMustTailCall() || C->isConvergent() ||
       F->isConvergent() || !C->paramHasAttr(0, Attribute::NoAlias) ||
       !C->paramHasAttr(1, Attribute::NoAlias))
+    return false;
+  // Contradictory call-site memory attributes can leave the call without a
+  // MemoryDef, even though its body writes to the destination.
+  auto *CallAccess = dyn_cast_or_null<MemoryDef>(MSSA->getMemoryAccess(C));
+  if (!CallAccess)
     return false;
   for (unsigned I = 0; I != C->arg_size(); ++I)
     if (C->isByValArgument(I) || C->paramHasAttr(I, Attribute::ByRef) ||
@@ -2315,7 +2320,8 @@ bool MemCpyOptPass::processForwardingCall(CallInst *C,
       if (auto *M = dyn_cast<MemCpyInst>(&I)) {
         auto *Len = dyn_cast<ConstantInt>(M->getLength());
         if (M->getIntrinsicID() == Intrinsic::memcpy_inline ||
-            M->isVolatile() || M->hasMetadataOtherThanDebugLoc() || !Len ||
+            M->isVolatile() || M->hasOperandBundles() || M->isConvergent() ||
+            M->hasMetadataOtherThanDebugLoc() || !Len ||
             Len->getValue().getActiveBits() > 64)
           return false;
         Range = getForwardingRange(
@@ -2368,9 +2374,9 @@ bool MemCpyOptPass::processForwardingCall(CallInst *C,
   IRBuilder<> Builder(C);
   Builder.SetCurrentDebugLocation(C->getDebugLoc());
   auto *M = Builder.CreateMemCpy(Dest, Dest->getAlign(), Src, Src->getAlign(),
-                                 DestSize->getFixedValue());
+                                DestSize->getFixedValue());
   auto *NewAccess =
-      MSSAU->createMemoryAccessBefore(M, nullptr, MSSA->getMemoryAccess(C));
+      MSSAU->createMemoryAccessBefore(M, nullptr, CallAccess);
   MSSAU->insertDef(cast<MemoryDef>(NewAccess), /*RenameUses=*/true);
   eraseInstruction(C);
   BBI = M->getIterator();
