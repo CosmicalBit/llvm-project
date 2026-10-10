@@ -395,13 +395,19 @@ static bool instructionDoesNotReturn(const Instruction &I) {
 
 // A basic block can only return if it terminates with a ReturnInst and does not
 // contain calls to noreturn functions.
-static bool basicBlockCanReturn(const BasicBlock &BB) {
+static bool basicBlockCanReturn(const BasicBlock &BB, const Function &F) {
   if (!isa<ReturnInst>(BB.getTerminator()))
     return false;
-  return none_of(BB, instructionDoesNotReturn);
+  return none_of(BB, [&](const Instruction &I) {
+    if (instructionDoesNotReturn(I))
+      return true;
+    const auto *CB = dyn_cast<CallBase>(&I);
+    return CB && CB->getCalledFunction() == &F;
+  });
 }
 
-// FIXME: this doesn't handle recursion.
+// Calls through other functions, including mutual recursion, are assumed to
+// return unless they are already marked noreturn.
 bool llvm::canReturn(const Function &F) {
   SmallVector<const BasicBlock *, 16> Worklist;
   SmallPtrSet<const BasicBlock *, 16> Visited;
@@ -411,8 +417,22 @@ bool llvm::canReturn(const Function &F) {
 
   do {
     const BasicBlock *BB = Worklist.pop_back_val();
-    if (basicBlockCanReturn(*BB))
+    if (basicBlockCanReturn(*BB, F))
       return true;
+    // A direct recursive call cannot reach the following instruction unless
+    // some other path through the function returns first.
+    if (any_of(*BB, [&](const Instruction &I) {
+          const auto *CB = dyn_cast<CallInst>(&I);
+          return CB && CB->getCalledFunction() == &F;
+        }))
+      continue;
+    if (const auto *II = dyn_cast<InvokeInst>(BB->getTerminator())) {
+      if (II->getCalledFunction() == &F) {
+        if (Visited.insert(II->getUnwindDest()).second)
+          Worklist.push_back(II->getUnwindDest());
+        continue;
+      }
+    }
     for (const BasicBlock *Succ : successors(BB))
       if (Visited.insert(Succ).second)
         Worklist.push_back(Succ);
