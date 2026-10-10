@@ -222,6 +222,9 @@ sinkInstruction(const ScalarOptions &Opts, Loop &L, Instruction &I,
   if (BBsToSinkInto.empty())
     return false;
 
+  if (I.getFunction()->hasOptSize() && BBsToSinkInto.size() > 1)
+    return false;
+
   // Return if any of the candidate blocks to sink into is non-cold.
   if (BBsToSinkInto.size() > 1 &&
       !llvm::set_is_subset(BBsToSinkInto, LoopBlockNumber))
