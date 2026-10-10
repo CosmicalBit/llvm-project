@@ -3075,7 +3075,8 @@ public:
 ///         null otherwise.
 static Value *isSafeToSpeculateStore(Instruction *I, BasicBlock *BrBB,
                                      BasicBlock *StoreBB, BasicBlock *EndBB,
-                                     Instruction *&PreviousAccess) {
+                                     Instruction *&PreviousAccess,
+                                     const TargetLibraryInfo *TLI) {
   StoreInst *StoreToHoist = dyn_cast<StoreInst>(I);
   if (!StoreToHoist)
     return nullptr;
@@ -3125,7 +3126,7 @@ static Value *isSafeToSpeculateStore(Instruction *I, BasicBlock *BrBB,
         // The dereferenceability query here is only required to satisfy the
         // writable contract, actual dereferenceability is proven by the
         // presence of an access. As such, we can ignore frees.
-        if (isWritableObject(Obj, ExplicitlyDereferenceableOnly) &&
+        if (isWritableObject(Obj, ExplicitlyDereferenceableOnly, TLI) &&
             capturesNothing(
                 PointerMayBeCaptured(Obj, CaptureComponents::Provenance)
                     .WithoutRet) &&
@@ -3334,8 +3335,8 @@ bool SimplifyCFGOpt::speculativelyExecuteBB(CondBrInst *BI,
     if (!IsSafeCheapLoadStore &&
         !isSafeToSpeculativelyExecute(&I, BI, Options.AC) &&
         !(HoistCondStores && !SpeculatedStoreValue &&
-          (SpeculatedStoreValue = isSafeToSpeculateStore(&I, BB, ThenBB, EndBB,
-                                                         PreviousStoreAccess))))
+          (SpeculatedStoreValue = isSafeToSpeculateStore(
+               &I, BB, ThenBB, EndBB, PreviousStoreAccess, Options.TLI))))
       return false;
     if (!IsSafeCheapLoadStore && !SpeculatedStoreValue &&
         computeSpeculationCost(&I, TTI) >

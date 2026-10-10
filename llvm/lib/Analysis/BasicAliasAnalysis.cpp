@@ -1188,14 +1188,14 @@ AliasResult BasicAAResult::aliasGEP(
   if (DecompGEP1.NWFlags.isInBounds() && DecompGEP1.VarIndices.empty() &&
       V2Size.hasValue() && !V2Size.isScalable() &&
       DecompGEP1.Offset.sge(V2Size.getValue()) &&
-      isBaseOfObject(DecompGEP2.Base))
+      isBaseOfObject(DecompGEP2.Base, &TLI))
     return AliasResult::NoAlias;
 
   // Symmetric case to above.
   if (DecompGEP2.NWFlags.isInBounds() && DecompGEP1.VarIndices.empty() &&
       V1Size.hasValue() && !V1Size.isScalable() &&
       DecompGEP1.Offset.sle(-V1Size.getValue()) &&
-      isBaseOfObject(DecompGEP1.Base))
+      isBaseOfObject(DecompGEP1.Base, &TLI))
     return AliasResult::NoAlias;
 
   // For GEPs with identical offsets, we can preserve the size and AAInfo

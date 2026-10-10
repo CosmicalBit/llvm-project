@@ -911,7 +911,9 @@ LLVM_ABI bool isIdentifiedFunctionLocal(const Value *V);
 /// for the underlying object.  Note that just being isIdentifiedObject() is
 /// not enough - For example, a negative offset from a noalias argument or call
 /// can be inbounds w.r.t the actual underlying object.
-LLVM_ABI bool isBaseOfObject(const Value *V);
+/// Known allocation calls are recognized when \p TLI is provided.
+LLVM_ABI bool isBaseOfObject(const Value *V,
+                             const TargetLibraryInfo *TLI = nullptr);
 
 /// Returns true if the pointer is one which would have been considered an
 /// escape by isNotCapturedBefore.
@@ -936,8 +938,10 @@ LLVM_ABI bool isNotVisibleOnUnwind(const Value *Object,
 /// using the dereferenceable(N) attribute. It does not necessarily hold for
 /// parts that are only known to be dereferenceable due to the presence of
 /// loads.
+/// Known allocation calls are recognized when \p TLI is provided.
 LLVM_ABI bool isWritableObject(const Value *Object,
-                               bool &ExplicitlyDereferenceableOnly);
+                               bool &ExplicitlyDereferenceableOnly,
+                               const TargetLibraryInfo *TLI = nullptr);
 
 /// Get ModRefInfo for a synchronizing operation, such as a fence or stronger
 /// than monotonic atomic load/store.

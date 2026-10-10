@@ -19,6 +19,7 @@
 namespace llvm {
 
 class AssumptionCache;
+class TargetLibraryInfo;
 
 struct SimplifyCFGOptions {
   int BonusInstThreshold = 1;
@@ -35,6 +36,7 @@ struct SimplifyCFGOptions {
   bool SpeculateUnpredictables = false;
 
   AssumptionCache *AC = nullptr;
+  const TargetLibraryInfo *TLI = nullptr;
 
   // Support 'builder' pattern to set members by name at construction time.
   SimplifyCFGOptions &bonusInstThreshold(int I) {

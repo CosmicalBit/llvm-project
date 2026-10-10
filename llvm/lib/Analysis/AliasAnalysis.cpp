@@ -29,6 +29,7 @@
 #include "llvm/Analysis/CaptureTracking.h"
 #include "llvm/Analysis/GlobalsModRef.h"
 #include "llvm/Analysis/MemoryLocation.h"
+#include "llvm/Analysis/MemoryBuiltins.h"
 #include "llvm/Analysis/ScalarEvolutionAliasAnalysis.h"
 #include "llvm/Analysis/ScopedNoAliasAA.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
@@ -679,10 +680,10 @@ ModRefInfo AAResults::getModRefInfo(const Instruction *I,
 /// Return information about whether a particular call site modifies
 /// or reads the specified memory location \p MemLoc before instruction \p I
 /// in a BasicBlock.
-/// FIXME: this is really just shoring-up a deficiency in alias analysis.
-/// BasicAA isn't willing to spend linear time determining whether an alloca
-/// was captured before or after this particular call, while we are. However,
-/// with a smarter AA in place, this test is just wasting compile time.
+/// Resolve cases where alias analysis cannot rule out an indirect access to
+/// a function-local object. Unlike BasicAA, this fallback checks whether the
+/// object was captured before the call. Callers should first query AA and
+/// invoke this more expensive check only when AA reports a possible access.
 ModRefInfo AAResults::callCapturesBefore(const Instruction *I,
                                          const MemoryLocation &MemLoc,
                                          DominatorTree *DT,
@@ -924,12 +925,11 @@ bool llvm::isIdentifiedFunctionLocal(const Value *V) {
   return isa<AllocaInst>(V) || isNoAliasCall(V) || isNoAliasOrByValArgument(V);
 }
 
-bool llvm::isBaseOfObject(const Value *V) {
-  // TODO: We can handle other cases here
-  // 1) For GC languages, arguments to functions are often required to be
-  //    base pointers.
-  // 2) Result of allocation routines are often base pointers.  Leverage TLI.
-  return (isa<AllocaInst>(V) || isa<GlobalVariable>(V));
+bool llvm::isBaseOfObject(const Value *V, const TargetLibraryInfo *TLI) {
+  // TODO: For GC languages, arguments to functions are often required to be
+  // base pointers.
+  return isa<AllocaInst>(V) || isa<GlobalVariable>(V) ||
+         isAllocLikeFn(V, TLI);
 }
 
 bool llvm::isEscapeSource(const Value *V) {
@@ -998,7 +998,8 @@ bool llvm::isNotVisibleOnUnwind(const Value *Object,
 // We don't consider globals as writable: While the physical memory is writable,
 // we may not have provenance to perform the write.
 bool llvm::isWritableObject(const Value *Object,
-                            bool &ExplicitlyDereferenceableOnly) {
+                            bool &ExplicitlyDereferenceableOnly,
+                            const TargetLibraryInfo *TLI) {
   ExplicitlyDereferenceableOnly = false;
 
   // TODO: Alloca might not be writable after its lifetime ends.
@@ -1018,7 +1019,7 @@ bool llvm::isWritableObject(const Value *Object,
     return A->hasByValAttr();
   }
 
-  // TODO: Noalias shouldn't imply writability, this should check for an
-  // allocator function instead.
-  return isNoAliasCall(Object);
+  // A noalias return can still point to read-only memory. An allocation call
+  // provides writable storage for any part of the object that is accessible.
+  return isAllocLikeFn(Object, TLI);
 }

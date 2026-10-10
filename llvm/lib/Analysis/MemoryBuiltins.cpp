@@ -120,6 +120,8 @@ struct AllocFnsTy {
 // FIXME: certain users need more information. E.g., SimplifyLibCalls needs to
 // know which functions are nounwind, noalias, nocapture parameters, etc.
 static const std::pair<LibFunc, AllocFnsTy> AllocationFnData[] = {
+    {LibFunc_malloc,                                           {MallocLike, 1,  0, -1, -1, MallocFamily::Malloc}},             // malloc(size)
+    {LibFunc_calloc,                                           {MallocLike, 2,  0,  1, -1, MallocFamily::Malloc}},             // calloc(count, size)
     {LibFunc_Znwj,                                            {OpNewLike,  1,  0, -1, -1, MallocFamily::CPPNew}},             // new(unsigned int)
     {LibFunc_ZnwjRKSt9nothrow_t,                              {MallocLike, 2,  0, -1, -1, MallocFamily::CPPNew}},             // new(unsigned int, nothrow)
     {LibFunc_ZnwjSt11align_val_t,                             {OpNewLike,  2,  0, -1,  1, MallocFamily::CPPNewAligned}},      // new(unsigned int, align_val_t)

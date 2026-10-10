@@ -904,7 +904,7 @@ bool MemCpyOptPass::performCallSlotOptzn(Instruction *cpyLoad,
   // trap or data race.
   bool ExplicitlyDereferenceableOnly;
   if (!isWritableObject(getUnderlyingObject(cpyDest),
-                        ExplicitlyDereferenceableOnly) ||
+                        ExplicitlyDereferenceableOnly, TLI) ||
       !isDereferenceablePointer(cpyDest, APInt(64, cpySize),
                                 SimplifyQuery(DL, DT, AC, C))) {
     // If the call is guaranteed to return normally (willreturn + nounwind),

@@ -1908,7 +1908,7 @@ bool llvm::promoteLoopAccessesToScalars(
     // The dereferenceability query here is only required to satisfy the
     // writable contract, actual dereferenceability has already been proven
     // above. As such, we can ignore frees.
-    if (isWritableObject(Object, ExplicitlyDereferenceableOnly) &&
+    if (isWritableObject(Object, ExplicitlyDereferenceableOnly, TLI) &&
         (!ExplicitlyDereferenceableOnly ||
          isDereferenceablePointer(SomePtr, AccessTy, MDL,
                                   /*IgnoreFree=*/true)) &&
