@@ -634,6 +634,10 @@ class InlineCostCallAnalyzer final : public CallAnalyzer {
   // True if the cost-benefit-analysis-based inliner is enabled.
   const bool CostBenefitAnalysisEnabled;
 
+  // A zero hot callsite threshold suppresses cost-benefit decisions for that
+  // callsite, even if later adjustments change the effective threshold.
+  bool SuppressCostBenefitAnalysis = false;
+
   /// Inlining cost measured in abstract units, accounts for all the
   /// instructions expected to be executed for a given function invocation.
   /// Instructions that are statically proven to be dead based on call-site
@@ -970,11 +974,9 @@ class InlineCostCallAnalyzer final : public CallAnalyzer {
     if (!CostBenefitAnalysisEnabled)
       return std::nullopt;
 
-    // buildInlinerPipeline in the pass builder sets HotCallSiteThreshold to 0
-    // for the prelink phase of the AutoFDO + ThinLTO build.  Honor the logic by
-    // falling back to the cost-based metric.
-    // TODO: Improve this hacky condition.
-    if (Threshold == 0)
+    // The prelink SamplePGO pipeline uses a zero hot callsite threshold to
+    // limit inlining before profile annotation in the backend.
+    if (Threshold == 0 || SuppressCostBenefitAnalysis)
       return std::nullopt;
 
     assert(GetBFI);
@@ -2145,6 +2147,7 @@ void InlineCostCallAnalyzer::updateThreshold(CallBase &Call, Function &Callee) {
     auto HotCallSiteThreshold = getHotCallSiteThreshold(Call, CallerBFI);
     if (!Caller->hasOptSize() && HotCallSiteThreshold) {
       LLVM_DEBUG(dbgs() << "Hot callsite.\n");
+      SuppressCostBenefitAnalysis = *HotCallSiteThreshold == 0;
       // FIXME: This should update the threshold only if it exceeds the
       // current threshold, but AutoFDO + ThinLTO currently relies on this
       // behavior to prevent inlining of hot callsites during ThinLTO
