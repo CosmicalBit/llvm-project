@@ -33,6 +33,7 @@ set(ANALYSIS_TEST_SOURCES
   GlobalsModRefTest.cpp
   FunctionPropertiesAnalysisTest.cpp
   InlineCostTest.cpp
+  InstructionSimplifyTest.cpp
   IR2VecTest.cpp
   IVDescriptorsTest.cpp
   LastRunTrackingAnalysisTest.cpp

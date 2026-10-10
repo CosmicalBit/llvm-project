@@ -206,6 +206,32 @@ define float @fsub_x_x(float %a) {
   ret float %ret
 }
 
+define float @fsub_x_x_known_finite(float nofpclass(nan inf) %x) {
+; CHECK-LABEL: @fsub_x_x_known_finite(
+; CHECK-NEXT:    ret float 0.000000e+00
+;
+  %r = fsub float %x, %x
+  ret float %r
+}
+
+define float @fsub_x_x_may_be_inf(float nofpclass(nan) %x) {
+; CHECK-LABEL: @fsub_x_x_may_be_inf(
+; CHECK-NEXT:    [[R:%.*]] = fsub float [[X:%.*]], [[X]]
+; CHECK-NEXT:    ret float [[R]]
+;
+  %r = fsub float %x, %x
+  ret float %r
+}
+
+define float @fsub_x_x_may_be_nan(float nofpclass(inf) %x) {
+; CHECK-LABEL: @fsub_x_x_may_be_nan(
+; CHECK-NEXT:    [[R:%.*]] = fsub float [[X:%.*]], [[X]]
+; CHECK-NEXT:    ret float [[R]]
+;
+  %r = fsub float %x, %x
+  ret float %r
+}
+
 ; fsub nsz 0.0, (fsub 0.0, X) ==> X
 define float @fsub_0_0_x(float %a) {
 ; CHECK-LABEL: @fsub_0_0_x(

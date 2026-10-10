@@ -5853,10 +5853,17 @@ static Value *simplifyShuffleVectorInst(Value *Op0, Value *Op1,
   if (!Scalable && match(Op0, m_InsertElt(m_Value(), m_Constant(C),
                                           m_ConstantInt(IndexC)))) {
     // Match a splat shuffle mask of the insert index allowing undef elements.
-    int InsertIndex = IndexC->getZExtValue();
-    if (all_of(Indices, [InsertIndex](int MaskElt) {
-          return MaskElt == InsertIndex || MaskElt == -1;
-        })) {
+    // An out-of-range insertelement index produces poison. Do not truncate it
+    // to int, where it could appear to match a valid shuffle index.
+    uint64_t InsertIndex = IndexC->getValue().getLimitedValue();
+    if (InsertIndex < InVecEltCount.getKnownMinValue() &&
+        all_of(
+            Indices,
+            [InsertIndex](int MaskElt) {
+              return MaskElt == -1 ||
+                     (MaskElt >= 0 &&
+                      static_cast<uint64_t>(MaskElt) == InsertIndex);
+            })) {
       assert(isa<UndefValue>(Op1) && "Expected undef operand 1 for splat");
 
       // Shuffle mask poisons become poison constant result elements.
@@ -6132,11 +6139,13 @@ simplifyFSubInst(Value *Op0, Value *Op1, FastMathFlags FMF,
   if (!isDefaultFPEnvironment(ExBehavior, Rounding))
     return nullptr;
 
-  if (FMF.noNaNs()) {
-    // fsub nnan x, x ==> 0.0
-    if (Op0 == Op1)
-      return Constant::getNullValue(Op0->getType());
+  // X - X is +0 for finite, non-NaN X. With nnan, an invalid result is poison.
+  if (Op0 == Op1 &&
+      (FMF.noNaNs() ||
+       computeKnownFPClass(Op0, fcNan | fcInf, Q).isKnownNever(fcNan | fcInf)))
+    return Constant::getNullValue(Op0->getType());
 
+  if (FMF.noNaNs()) {
     // With nnan: {+/-}Inf - X --> {+/-}Inf
     if (match(Op0, m_Inf()))
       return Op0;
