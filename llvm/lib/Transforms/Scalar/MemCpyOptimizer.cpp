@@ -635,17 +635,21 @@ bool MemCpyOptPass::processStoreOfLoad(StoreInst *SI, LoadInst *LI,
   if (T->isAggregateType()) {
     MemoryLocation LoadLoc = MemoryLocation::get(LI);
 
-    // We use alias analysis to check if an instruction may store to
-    // the memory we load from in between the load and the store. If
-    // such an instruction is found, we try to promote there instead
-    // of at the store position.
-    // TODO: Can use MSSA for this.
+    // Find the first memory definition between the load and store that may
+    // modify the loaded location. Promoting there preserves the loaded value.
     Instruction *P = SI;
-    for (auto &I : make_range(++LI->getIterator(), SI->getIterator())) {
-      if (isModSet(BAA.getModRefInfo(&I, LoadLoc))) {
-        P = &I;
+    auto *StoreAccess = cast<MemoryDef>(MSSA->getMemoryAccess(SI));
+    for (MemoryAccess *MA = StoreAccess->getDefiningAccess();
+         !MSSA->isLiveOnEntryDef(MA);) {
+      auto *MD = dyn_cast<MemoryDef>(MA);
+      if (!MD)
         break;
-      }
+      Instruction *I = MD->getMemoryInst();
+      if (I->getParent() != LI->getParent() || !LI->comesBefore(I))
+        break;
+      if (isModSet(BAA.getModRefInfo(I, LoadLoc)))
+        P = I;
+      MA = MD->getDefiningAccess();
     }
 
     // If we found an instruction that may write to the loaded memory,
