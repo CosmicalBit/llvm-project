@@ -44,6 +44,7 @@
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/AliasSetTracker.h"
 #include "llvm/Analysis/AssumptionCache.h"
+#include "llvm/Analysis/CFG.h"
 #include "llvm/Analysis/CaptureTracking.h"
 #include "llvm/Analysis/DomTreeUpdater.h"
 #include "llvm/Analysis/GuardUtils.h"
@@ -812,8 +813,9 @@ static bool hoistInsertPastInsert(InsertElementInst *Ins, Loop *CurLoop,
 
 // Return true if LI is invariant within scope of the loop. LI is invariant if
 // CurLoop is dominated by an invariant.start representing the same memory
-// location and size as the memory location LI loads from, and also the
-// invariant.start has no uses.
+// location and size as the memory location LI loads from. The invariant.start
+// must either have no uses or have only matching ends after leaving CurLoop,
+// none of which can reach the loop again.
 static bool isLoadInvariantInLoop(LoadInst *LI, DominatorTree *DT,
                                   Loop *CurLoop) {
   Value *Addr = LI->getPointerOperand();
@@ -845,10 +847,7 @@ static bool isLoadInvariantInLoop(LoadInst *LI, DominatorTree *DT,
     if (++UsesVisited > ScalarOptions::Global.licm_max_num_uses_traversed)
       return false;
     IntrinsicInst *II = dyn_cast<IntrinsicInst>(U);
-    // If there are escaping uses of invariant.start instruction, the load maybe
-    // non-invariant.
-    if (!II || II->getIntrinsicID() != Intrinsic::invariant_start ||
-        !II->use_empty())
+    if (!II || II->getIntrinsicID() != Intrinsic::invariant_start)
       continue;
     ConstantInt *InvariantSize = cast<ConstantInt>(II->getArgOperand(0));
     // The intrinsic supports having a -1 argument for variable sized objects
@@ -860,8 +859,32 @@ static bool isLoadInvariantInLoop(LoadInst *LI, DominatorTree *DT,
     // in bits. Also, the invariant.start should dominate the load, and we
     // should not hoist the load out of a loop that contains this dominating
     // invariant.start.
-    if (LocSizeInBits.getFixedValue() <= InvariantSizeInBits &&
-        DT->properlyDominates(II->getParent(), CurLoop->getHeader()))
+    if (LocSizeInBits.getFixedValue() > InvariantSizeInBits ||
+        !DT->properlyDominates(II->getParent(), CurLoop->getHeader()))
+      continue;
+
+    if (II->use_empty())
+      return true;
+
+    // Every use must be a direct end after entering the loop, with no path
+    // back to the loop. An end on each exit is allowed, but escaping uses or
+    // even one end before a later iteration invalidate this proof.
+    bool AllEndsAfterLoop = true;
+    for (const User *U : II->users()) {
+      if (++UsesVisited > ScalarOptions::Global.licm_max_num_uses_traversed)
+        return false;
+      const auto *End = dyn_cast<IntrinsicInst>(U);
+      if (!End || End->getIntrinsicID() != Intrinsic::invariant_end ||
+          End->getArgOperand(0) != II ||
+          CurLoop->contains(End->getParent()) ||
+          !DT->dominates(CurLoop->getHeader(), End->getParent()) ||
+          isPotentiallyReachable(End->getParent(), CurLoop->getHeader(),
+                                 nullptr, DT)) {
+        AllEndsAfterLoop = false;
+        break;
+      }
+    }
+    if (AllEndsAfterLoop)
       return true;
   }
 
