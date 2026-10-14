@@ -396,14 +396,13 @@ ModRefInfo AAResults::getModRefInfo(const Instruction *I1,
   if (const auto *Call2 = dyn_cast<CallBase>(I2))
     return getModRefInfo(I1, Call2, AAQI);
 
-  // FIXME: We can have a more precise result.
   ModRefInfo MR = getModRefInfo(I1, MemoryLocation::getOrNone(I2), AAQI);
 
-  if (isa<LoadInst>(I1) && (isa<LoadInst>(I2) || isa<StoreInst>(I2)) &&
-      !I1->isAtomic() && !I2->isAtomic() && !I1->isVolatile() &&
-      !I2->isVolatile()) {
-
-    return MR;
+  if (const auto *L = dyn_cast<LoadInst>(I1)) {
+    if (L->isUnordered() &&
+        ((isa<LoadInst>(I2) && cast<LoadInst>(I2)->isUnordered()) ||
+         (isa<StoreInst>(I2) && cast<StoreInst>(I2)->isUnordered())))
+      return MR;
   }
 
   return isModOrRefSet(MR) ? ModRefInfo::ModRef : ModRefInfo::NoModRef;

@@ -242,7 +242,7 @@ TEST_F(AliasAnalysisTest, getModRefInfo) {
 
   // Stronger atomic ordering remains conservative.
   EXPECT_EQ(AA.getModRefInfo(AtomicLoad, Store1), ModRefInfo::ModRef);
-  EXPECT_EQ(AA.getModRefInfo(UnorderedLoad, Store1), ModRefInfo::ModRef);
+  EXPECT_EQ(AA.getModRefInfo(UnorderedLoad, Store1), ModRefInfo::Ref);
 
   // Volatile accesses retain the original conservative behavior.
   EXPECT_EQ(AA.getModRefInfo(VolatileLoad, Store1), ModRefInfo::ModRef);
